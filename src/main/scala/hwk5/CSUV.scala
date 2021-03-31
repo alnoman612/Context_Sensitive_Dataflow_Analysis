@@ -6,73 +6,104 @@ package hwk5
 
 import common._
 
+// set of variables that may be uninitialized
+case class Context(call_strings: List[Long]) {
+  val k = 2
 
-// uninitialized variables: forward and may analysis
-case class CSUV(stmt: Statement) extends Analysis[Vars] {
+  def extend(label: Long) = {
+    val x = call_strings ++ List(label)
+    Context(if (x.length > k) x.drop(1) else x)
+  }
+}
+
+case class CSVars(vars: Set[(Context, String)]) extends Lattice[CSVars] {
+  def lub(that: CSVars) = CSVars(vars.union(that.vars))
+
+  val contexts = vars.map(x => x._1).toSet
+
+  def variables(ctx: Context) = vars.filter(x => x._1 == ctx).map(x => x._2)
+
+  def inInitialized(e: Expression, ctx: Context) = Util.fv(e).intersect(variables(ctx)).isEmpty
+
+  def kill_gen(y: String, e: Expression) = {
+    val gen = for (ctx <- contexts; if inInitialized(e, ctx)) yield (ctx, y)
+    val kill = for (ctx <- contexts; if !inInitialized(e, ctx)) yield (ctx, y)
+    CSVars(vars -- kill ++ gen)
+  }
+
+  def gen(y: String) = CSVars(vars ++ contexts.map(ctx => (ctx, y)))
+
+  def gen(ys: List[String]) = CSVars(vars ++ contexts.flatMap(ctx => ys.map(y => (ctx, y))))
+
+  def extend(lc: Long) = CSVars(contexts.map(ctx => ctx.extend(lc)).toSet.map((ctx: Context) => (ctx, Util.zero)))
+
+  override def toString: String = "{" + vars.toList.sortBy(x => x._2).mkString(",") + "}"
+}
+
+case class CSUV(stmt: Statement) extends Analysis[CSVars] {
   val cfg = ForwardCFG(stmt)
   val entry = real_entry
   val exit = real_exit
 
-  val extremalValue = Vars(Util.vars(stmt))
-  val bottom = Vars(Set())
+  val extremalValue = CSVars((Util.vars(stmt) + Util.zero).map(x => (Context(Nil), x)))
+  val bottom = CSVars(Set())
 
-  def transfer(node: Node, l: Vars) = node match {
+  def transfer(node: Node, l: CSVars): CSVars = node match {
     case IntraNode(stmt) => transfer(stmt, l)
 
-    // for each parameter p, if its argument is not initialized, then p is not initialized
     case CallNode(stmt, to) => {
-      def h(args: List[Expression]) = {
+      def h(args: List[Expression]): CSVars = {
         val Some(FunctionDecl(_, FunctionExpr(_, ps, _))) = to.f
         val params = ps.map(p => p.str)
-        val s = for((p, e) <- params zip args; if initialized(e, l)) yield p
-        Vars(params.toSet -- s)     // function f(x, y) { ... }   f(10);
+        val l1 = l.extend(stmt.id).gen(params)
+        val ye = params zip args
+        val gen = for (ctx <- l.contexts; (y, e) <- ye; if l.inInitialized(e, ctx)) yield (ctx.extend(stmt.id), y)
+        val kill = for (ctx <- l.contexts; (y, e) <- ye; if l.inInitialized(e, ctx)) yield (ctx.extend(stmt.id), y)
+        CSVars(l1.vars -- kill ++ gen)
       }
-
       stmt match {
-        case ExprStmt(FuncCall(_, args)) => h(args)                       // f(a);
-        case ExprStmt(AssignExpr(_, _, FuncCall(_, args))) => h(args)     // x = f(a);
-        case VarDeclStmt(_, FuncCall(_, args)) => h(args)                 // var x = f(a);
+        case ExprStmt(FuncCall(_, args)) => h(args)
+        case ExprStmt(AssignExpr(_, _, FuncCall(_, args))) => h(args)
+        case VarDeclStmt(_, FuncCall(_, args)) => h(args)
         case _ => bottom
       }
     }
-    // add variables appearing in the body of the function and the return variable
-    case EntryNode(Some(FunctionDecl(_, FunctionExpr(_,ps,stmt)))) => {
-      Vars(l.vars ++ (Util.vars(stmt) -- ps.map(p=>p.str)) + Util.ret) // uninitialized parameters + all local variables (minus parameters) + return variable
-    }
 
-    case ExitNode(Some(_)) => Vars(l.vars.intersect(Set(Util.ret))) // keep the return variable if it is present
+
+    //case ExitNode(Some(_)) => CSVars(l.vars.intersect(l.vars.map(Util.ret)))
 
     case n@RetNode(stmt, _) => {
-      val lc = entry(cfg.call_ret(n))  // dataflow facts before the call
+      val lc = entry(cfg.call_ret(n))
 
-      def h(x: String) = Vars(if (l.vars.contains(Util.ret)) lc.vars + x else lc.vars - x)
+      def h(x: String) = {
+        val kill = for (ctx <- lc.contexts; if !l.vars.contains(ctx.extend(stmt.id), Util.ret)) yield (ctx, x)
+        val gen = for (ctx <- lc.contexts; if l.vars.contains(ctx.extend(stmt.id), Util.ret)) yield (ctx, x)
+      }
 
       stmt match {
-        case ExprStmt(AssignExpr(_, LVarRef(x), FuncCall(_, _))) => h(x) // x = f(e);
-        case VarDeclStmt(IntroduceVar(x), FuncCall(_, _)) => h(x)    // var x = f(e);
+//        case ExprStmt(AssignExpr(_, LVarRef(x), FuncCall(_, _))) => h(x)
+//        case VarDeclStmt(IntroduceVar(x), FuncCall(_, _)) => h(x)
         case _ => lc // f(e);
       }
     }
-
     case _ => l
   }
 
-  // are variables in 'e' all initialized
-  def initialized(e: Expression, l: Vars) = Util.fv(e).intersect(l.vars).isEmpty
+  def initialized(e: Expression, l: CSVars) = Util.fv(e).intersect(l.vars.map(x => x._2)).isEmpty
 
-  def transfer(stmt: Statement, l: Vars) = {
-    def kill_gen(y: String, e: Expression) = Vars(if (initialized(e, l)) l.vars - y else l.vars + y)
-
+  def transfer(stmt: Statement, l: CSVars) = {
     stmt match {
       case VarDeclStmt(IntroduceVar(y), e) => {
         e match {
-          case EmptyExpr() => Vars(l.vars + y)      // var y;
-          case _ => kill_gen(y, e)                  // var y = e;
+          case EmptyExpr() => l.gen(y)
+          case _ => l.kill_gen(y, e)
         }
       }
-      case ExprStmt(AssignExpr(_, LVarRef(y), e)) => kill_gen(y, e) // y = e;
-      case ReturnStmt(e) => kill_gen(Util.ret, e)  // return e;
-      case _ => l
+
+      case ExprStmt(AssignExpr(_, LVarRef(y), e)) => l.kill_gen(y, e)
+      case ReturnStmt(e) => l.kill_gen(Util.ret, e)
     }
   }
+
 }
+
