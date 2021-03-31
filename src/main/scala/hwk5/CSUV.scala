@@ -69,8 +69,10 @@ case class CSUV(stmt: Statement) extends Analysis[CSVars] {
       }
     }
 
-
-    //case ExitNode(Some(_)) => CSVars(l.vars.intersect(l.vars.map(Util.ret)))
+    case EntryNode(Some(FunctionDecl(_, FunctionExpr(_,ps,stmt)))) => {
+      l.gen((Util.vars(stmt ) -- ps.map(p=> p.str) + Util.ret).toList)
+    }
+    case ExitNode(Some(_)) => CSVars(l.vars.filter(x=> x._2 == Util.ret))
 
     case n@RetNode(stmt, _) => {
       val lc = entry(cfg.call_ret(n))
